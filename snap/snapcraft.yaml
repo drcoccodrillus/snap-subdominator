@@ -1,0 +1,38 @@
+name: subdominator
+base: core22
+version: '1.0'
+summary: CLI tool for detecting subdomain takeovers
+description: |
+  Subdominator is an open source tool with a command line interface for identifying subdomain takeovers.
+  This tool comes from StratusSecurity, an Australian security company.
+  The source code is available at https://github.com/Stratus-Security/Subdominator
+
+#grade: devel           # This is for development only.
+#confinement: devmode   # This is for development only. Unconfined snap environment. For production, use strict.
+grade: stable           # This is for releasing in the stable channel.
+confinement: strict     # This is for production only.
+
+architectures:
+  - build-on: [amd64]
+    build-for: [amd64]
+
+apps:
+  subdominator:
+    command: bin/Subdominator
+    plugs: [home, network]
+
+parts:
+  subdominator:
+    plugin: dump
+    source: bin
+    organize:
+      Subdominator: bin/
+
+  # Install libicu from apt
+  libicu:
+    plugin: nil
+    stage-packages:
+      - libicu70
+    override-pull: |
+      apt-get update && apt-get upgrade -y
+      snapcraftctl pull
