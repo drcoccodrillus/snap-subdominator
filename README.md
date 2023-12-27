@@ -31,7 +31,7 @@ If you prefer to install the snap from a local file, follow the instructions bel
 
 For installing the snap from a local file, use the following command:
 
-`snap install subdominator_1.4_amd64.snap --dangerous`
+`snap install subdominator_1.5_amd64.snap --dangerous`
 
 ## Usage
 Using the snap is pretty straight forward.
