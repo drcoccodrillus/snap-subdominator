@@ -1,6 +1,8 @@
 ﻿using Nager.PublicSuffix;
 using System.Diagnostics;
 using System.CommandLine;
+using Subdominator.Models;
+using System.Text;
 
 namespace Subdominator;
 
@@ -10,6 +12,8 @@ public class Program
 
     public static async Task Main(string[] args)
     {
+        Console.OutputEncoding = Encoding.UTF8;
+
         var rootCommand = new RootCommand("A subdomain takover detection tool for cool kids");
 
         var optionDomain = new Option<string>(new[] { "-d", "--domain" }, "A single domain to check");
@@ -17,14 +21,18 @@ public class Program
         var optionOutput = new Option<string>(new[] { "-o", "--output" }, "Output subdomains to a file");
         var optionThreads = new Option<int>(new[] { "-t", "--threads" }, () => 50, "Number of domains to check at once");
         var optionVerbose = new Option<bool>(new[] { "-v", "--verbose" }, "Print extra information");
+        var optionExcludeUnlikely = new Option<bool>(new[] { "-eu", "--exclude-unlikely" }, "Exclude unlikely (edge-case) fingerprints");
+        var optionValidate = new Option<bool>(new[] { "--validate" }, "Validate the takeovers are exploitable (where possible)");
 
         rootCommand.AddOption(optionDomain);
         rootCommand.AddOption(optionList);
         rootCommand.AddOption(optionOutput);
         rootCommand.AddOption(optionThreads);
         rootCommand.AddOption(optionVerbose);
+        rootCommand.AddOption(optionExcludeUnlikely);
+        rootCommand.AddOption(optionValidate);
 
-        rootCommand.SetHandler(async (string domain, string domainsFile, string outputFile, int threads, bool verbose) =>
+        rootCommand.SetHandler(async (string domain, string domainsFile, string outputFile, int threads, bool verbose, bool excludeUnlikely, bool validate) =>
         {
             var options = new Options
             {
@@ -32,29 +40,31 @@ public class Program
                 DomainsFile = domainsFile,
                 OutputFile = outputFile,
                 Threads = threads,
-                Verbose = verbose
+                Verbose = verbose,
+                ExcludeUnlikely = excludeUnlikely,
+                Validate = validate
             };
             await RunSubdominator(options);
-        }, optionDomain, optionList, optionOutput, optionThreads, optionVerbose);
+        }, optionDomain, optionList, optionOutput, optionThreads, optionVerbose, optionExcludeUnlikely, optionValidate);
 
         // Parse the incoming args and invoke the handler
         await rootCommand.InvokeAsync(args);
     }
 
-    static async Task RunSubdominator(Options o)
+    public static async Task RunSubdominator(Options o)
     {
         // Get domain(s) from the options
         var rawDomains = new List<string>();
         if (!string.IsNullOrEmpty(o.DomainsFile))
         {
             string file = o.DomainsFile;
-            rawDomains = (await File.ReadAllLinesAsync(file)).ToList();
+            rawDomains = [.. (await File.ReadAllLinesAsync(file))];
         }
         else if (!string.IsNullOrEmpty(o.Domain))
         {
             rawDomains.Add(o.Domain);
         }
-        else 
+        else
         {
             throw new Exception("A domain (-d) or file (-l) must be specified.");
         }
@@ -62,20 +72,21 @@ public class Program
         // Define maximum concurrent tasks
         int maxConcurrentTasks = o.Threads;
         bool verbose = o.Verbose;
+        bool isAnyVulnerable = false;
 
         // Pre-check domains passed in and filter any that are invalid
         var domains = FilterAndNormalizeDomains(rawDomains);
 
         // Pre-load fingerprints to memory
         var hijackChecker = new SubdomainHijack();
-        await hijackChecker.GetFingerprintsAsync();
+        await hijackChecker.GetFingerprintsAsync(o.ExcludeUnlikely);
 
         // Do the things
         var stopwatch = new Stopwatch();
         stopwatch.Start();
 
         int completedTasks = 0;
-        var updateInterval = TimeSpan.FromSeconds(10);
+        var updateInterval = TimeSpan.FromSeconds(60);
 
         using var cts = new CancellationTokenSource();
         var updateTask = PeriodicUpdateAsync(updateInterval, () =>
@@ -91,7 +102,11 @@ public class Program
 
         await Parallel.ForEachAsync(domains, new ParallelOptions { MaxDegreeOfParallelism = maxConcurrentTasks }, async (domain, cancellationToken) =>
         {
-            await CheckAndLogDomain(hijackChecker, domain, o.OutputFile, verbose);
+            var isVulnerable = await CheckAndLogDomain(hijackChecker, domain, o.OutputFile, o.Validate, verbose);
+            if(isVulnerable)
+            {
+                isAnyVulnerable = true;
+            }
             Interlocked.Increment(ref completedTasks);
         });
 
@@ -104,6 +119,12 @@ public class Program
         var rate = completedTasks / elapsed.TotalSeconds;
         Console.WriteLine($"{completedTasks}/{domains.Count()} domains processed. Average rate: {rate:F2} domains/sec");
         Console.WriteLine("Done in " + stopwatch.Elapsed.TotalSeconds + "s");
+
+        // Exit non-zero if we have a takeover, for the DevOps folks
+        if (isAnyVulnerable)
+        {
+            Environment.ExitCode = 1;
+        }
     }
 
     static async Task PeriodicUpdateAsync(TimeSpan interval, Action action, CancellationToken cancellationToken)
@@ -124,7 +145,7 @@ public class Program
 
     static IEnumerable<string> FilterAndNormalizeDomains(List<string> domains, bool verbose = false)
     {
-        var domainParser = new DomainParser(new WebTldRuleProvider("https://raw.githubusercontent.com/Stratus-Security/Subdominator/master/Subdominator/public_suffix_list.dat"));
+        var domainParser = new DomainParser(new WebTldRuleProvider("https://raw.githubusercontent.com/Stratus-Security/Subdominator/master/Subdominator/public_suffix_list.dat", new FileCacheProvider(cacheTimeToLive: TimeSpan.FromSeconds(0))));
 
         // Normalize domains and check validity
         var normalizedDomains = domains
@@ -146,37 +167,63 @@ public class Program
         return normalizedDomains.Where(d => d.IsValid).Select(d => d.Original);
     }
 
-    static async Task CheckAndLogDomain(SubdomainHijack hijackChecker, string domain, string outputFile, bool verbose = false)
+    static async Task<bool> CheckAndLogDomain(SubdomainHijack hijackChecker, string domain, string outputFile, bool validateResults, bool verbose = false)
     {
+        bool isFound = false;
         try
         {
-            var (isVulnerable, fingerprint, cnames) = await hijackChecker.IsDomainVulnerable(domain);
-            if (isVulnerable || verbose)
+            var result = await hijackChecker.IsDomainVulnerable(domain, validateResults);
+            if (result.IsVulnerable || verbose)
             {
-                var fingerPrintName = fingerprint == null ? "-" : fingerprint.Service;
+                if (result.IsVulnerable)
+                {
+                    isFound = true;
+                }
+                var fingerPrintName = result.Fingerprint == null ? "-" : result.Fingerprint.Service;
 
                 // Build the output string
-                var output = $"[{fingerPrintName}] {domain}";
+                var output = $"{(result.IsVerified ? "✅ " : "")}[{fingerPrintName}] {domain} - CNAME: {string.Join(", ", result.CNAMES ?? [])}";
+
+                // Show where we matched the takeover
+                var locationString = "";
+                if(result.MatchedRecord == MatchedRecord.CNAME)
+                {
+                    if(result.MatchedLocation != MatchedLocation.DomainAvailable ||
+                        (result.MatchedLocation == MatchedLocation.DomainAvailable && result.CNAMES?.Any() == true)
+                    )
+                    {
+                        locationString = $" - CNAME: {string.Join(", ", result.CNAMES ?? [])}";
+                    }
+                }
+                else if(result.MatchedRecord == MatchedRecord.A)
+                {
+                    locationString = $" - A: {string.Join(", ", result.A ?? [])}";
+                }
+                else if (result.MatchedRecord == MatchedRecord.AAAA)
+                {
+                    locationString = $" - AAAA: {string.Join(", ", result.AAAA ?? [])}";
+                }
 
                 // Thread-safe console print and append to results file
                 lock (_fileLock)
                 {
-                    Console.Write("[");
-                    Console.ForegroundColor = isVulnerable ? ConsoleColor.Red : ConsoleColor.Green;
+                    Console.Write($"{(result.IsVerified ? "✅ " : "")}[");
+                    Console.ForegroundColor = result.IsVulnerable ? ConsoleColor.Red : ConsoleColor.Green;
                     Console.Write(fingerPrintName);
                     Console.ResetColor();
-                    Console.Write($"] {domain}\n");
+                    Console.Write($"] {domain}" + locationString + Environment.NewLine);
 
                     if (!string.IsNullOrWhiteSpace(outputFile))
                     {
-                        File.AppendAllText(outputFile, output + Environment.NewLine);
+                        File.AppendAllText(outputFile, output + locationString + Environment.NewLine);
                     }
                 }
             }
         }
-        catch (Exception ex) 
+        catch (Exception ex)
         {
             Console.WriteLine(ex.ToString());
         }
+        return isFound;
     }
 }
