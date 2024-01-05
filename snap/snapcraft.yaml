@@ -1,6 +1,6 @@
 name: subdominator
 base: core22
-version: '1.6'
+version: '1.61'
 summary: CLI tool for detecting subdomain takeovers
 description: |
   Subdominator is an open source tool with a command line interface for identifying subdomain takeovers.
